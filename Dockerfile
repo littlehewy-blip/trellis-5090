@@ -14,7 +14,10 @@
 FROM pytorch/pytorch:2.7.1-cuda12.8-cudnn9-devel
 
 # Compile parallelism. Lower it on RAM-limited builders (GitHub Actions 16GB
-# OOMs the flash-attn compile at 8) via `--build-arg MAX_JOBS=4`.
+# OOMs the flash-attn compile at 8 AND at 4) via `--build-arg MAX_JOBS=2`.
+# Peak build RAM ~= MAX_JOBS * NVCC_THREADS; flash-attn defaults NVCC_THREADS=4,
+# so we cap it to 2 here. 2*2 concurrent nvcc threads fits the 16GB free runner
+# for a single-arch (sm_120) build.
 ARG MAX_JOBS=8
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -23,6 +26,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH} \
     TORCH_CUDA_ARCH_LIST=12.0 \
     MAX_JOBS=${MAX_JOBS} \
+    NVCC_THREADS=2 \
     OPENCV_IO_ENABLE_OPENEXR=1 \
     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
     TRELLIS_DIR=/workspace/TRELLIS.2 \
