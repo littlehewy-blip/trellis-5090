@@ -19,7 +19,7 @@ FROM pytorch/pytorch:2.7.1-cuda12.8-cudnn9-devel
 # thread) + rely on the 20GB host swapfile (workflow step) for headroom.
 # MAX_JOBS covers the PyTorch cpp_extension builds (flash-attn); CMAKE/MAKEFLAGS
 # below cover the cmake/make sub-builds (o-voxel, nvdiffrast) that ignore MAX_JOBS.
-ARG MAX_JOBS=1
+ARG MAX_JOBS=2
 ARG NVCC_THREADS=1
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -29,8 +29,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
     TORCH_CUDA_ARCH_LIST=12.0 \
     MAX_JOBS=${MAX_JOBS} \
     NVCC_THREADS=${NVCC_THREADS} \
-    CMAKE_BUILD_PARALLEL_LEVEL=1 \
-    MAKEFLAGS=-j1 \
+    CMAKE_BUILD_PARALLEL_LEVEL=2 \
+    MAKEFLAGS=-j2 \
     PIP_NO_CACHE_DIR=1 \
     OPENCV_IO_ENABLE_OPENEXR=1 \
     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
@@ -53,7 +53,7 @@ COPY pod_setup.sh pod_worker.py proven_requirements.txt start_worker_hf.sh start
 # checks (nvidia-smi / cuda forwards / ops-probe / tee log-server / worker exec) —
 # those defer to first-run. SKIP_WEIGHTS=1 => the multi-GB TRELLIS.2-4B weights are
 # NOT baked (they mount/download at /workspace/weights at runtime).
-RUN BUILD_ONLY=1 SKIP_WEIGHTS=1 FORCE_CUDA=1 MAX_JOBS=1 NVCC_THREADS=1 CMAKE_BUILD_PARALLEL_LEVEL=1 MAKEFLAGS=-j1 TORCH_CUDA_ARCH_LIST=12.0 CUDA_VISIBLE_DEVICES= bash /workspace/pod_setup.sh
+RUN BUILD_ONLY=1 SKIP_WEIGHTS=1 FORCE_CUDA=1 MAX_JOBS=2 NVCC_THREADS=1 CMAKE_BUILD_PARALLEL_LEVEL=2 MAKEFLAGS=-j2 TORCH_CUDA_ARCH_LIST=12.0 CUDA_VISIBLE_DEVICES= bash /workspace/pod_setup.sh
 
 EXPOSE 8000
 
