@@ -46,7 +46,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /workspace
 
 # Proven build script + worker + pin list + first-run probe, from the VN pod.
-COPY pod_setup.sh pod_worker.py proven_requirements.txt start_worker_hf.sh ops_probe.py /workspace/
+COPY pod_setup.sh pod_worker.py proven_requirements.txt start_worker_hf.sh start_worker.sh ops_probe.py /workspace/
 
 # Compile CUDA ops + install pinned deps ONCE, GPU-FREE. BUILD_ONLY=1 => nvcc
 # cross-compiles the ops for sm_120 with no device, and skips the runtime GPU
@@ -62,6 +62,9 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=30s --start-period=15m --retries=3 \
   CMD curl -fsS http://localhost:8000/health || exit 1
 
-# start_worker_hf.sh reads /workspace/.hf_token (mount as secret at runtime) and
-# serves pod_worker.py on :8000. Weights download on first run if the volume is empty.
-CMD ["bash", "/workspace/start_worker_hf.sh"]
+# Entry = the SUPERVISOR (circ review 2026-08-08, A5 P0 crash fix): it runs start_worker_hf.sh
+# in a restart loop so a hard-CUDA-fault exit(77) reloads the model instead of killing the pod
+# (flock single-instance + pkill; backoff resets on the /workspace/.last_success marker, not
+# wall-time; worker stdout/stderr -> /workspace/worker.log). start_worker_hf.sh still reads
+# /workspace/.hf_token, runs the ops probe, downloads weights on first run, serves :8000.
+CMD ["bash", "/workspace/start_worker.sh"]

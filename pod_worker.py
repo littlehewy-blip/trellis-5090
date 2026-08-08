@@ -1091,6 +1091,19 @@ class Handler(BaseHTTPRequestHandler):
             self._error_500(name, exc)
             return
 
+        # --- poison-input quarantine (circ review 2026-08-08, A5 P0-6) -------
+        # An input that previously HARD-faulted is refused fast (422) before the GPU
+        # guard, so a re-feed cannot restart-storm the pod. Cleared by deleting
+        # /workspace/quarantine.json. OOM inputs are NOT quarantined (transient).
+        if _is_quarantined(img_path):
+            sys.stderr.write(f"[worker] 422 QUARANTINED input refused: {name}\n")
+            self._json(422, {"ok": False,
+                             "error": "input quarantined (previously hard-faulted)",
+                             "name": name},
+                       extra_headers={"X-Worker-Build": WORKER_BUILD})
+            shutil.rmtree(img_path.parent, ignore_errors=True)
+            return
+
         # --- phase 2: SERIAL-RENDER GUARD -----------------------------------
         # Non-blocking: a busy worker refuses immediately with 429 so the driver
         # can wait and re-offer, instead of a second render stacking on the GPU.
@@ -1117,8 +1130,25 @@ class Handler(BaseHTTPRequestHandler):
         _GEN_BUSY_SINCE, _GEN_BUSY_NAME = time.time(), name
         mark_progress("accepted")
         sent = False
+        _need_hard_restart = False
         try:
-            glb, geo_meta = image_to_glb_bytes(img_path)
+            try:
+                glb, geo_meta = image_to_glb_bytes(img_path)
+            except Exception as _oom_exc:
+                # circ review 2026-08-08 (Grok+GPT+A5 P0-1): a VAE-decoder OOM usually
+                # does NOT corrupt the CUDA context. Free VRAM and retry ONCE in-process
+                # (staying alive) rather than escalating to process death. A 2nd OOM
+                # propagates to the outer handler -> 500, and we STILL stay alive.
+                if _is_oom(_oom_exc):
+                    sys.stderr.write(
+                        f"[worker] OOM on {name}: freeing VRAM + retrying once "
+                        f"({type(_oom_exc).__name__})\n")
+                    sys.stderr.flush()
+                    _free_vram()
+                    mark_progress("oom-retry")  # reset watchdog stall timer for attempt 2
+                    glb, geo_meta = image_to_glb_bytes(img_path)
+                else:
+                    raise
             headers = {
                 "X-Geometry-Path": geo_meta.get("geometry_path", "unknown"),
                 "X-VRAM-Peak-MB": str(geo_meta.get("vram_peak_mb_end", -1)),
@@ -1127,6 +1157,7 @@ class Handler(BaseHTTPRequestHandler):
             sent = True
             self._bytes(200, glb, "model/gltf-binary", f"{name}.glb",
                         extra_headers=headers)
+            _mark_success()  # supervisor resets restart-backoff only on a real render (P0-3)
         except (BrokenPipeError, ConnectionResetError, socket.timeout,
                 TimeoutError) as exc:
             # The client (or the ssh tunnel) went away, or the send timed out on
@@ -1151,6 +1182,20 @@ class Handler(BaseHTTPRequestHandler):
                 self._error_500(name, exc)
         except Exception as exc:
             self._error_500(name, exc)
+            # circ review 2026-08-08 (Grok+GPT+A5 P0-1/P0-2/P0-6): OOM is non-fatal
+            # (retried above; a 2nd OOM lands here and we STAY ALIVE - usually transient
+            # VRAM contention with the char/money-line, not poison). A HARD/sticky CUDA
+            # fault corrupts the context and would crash the process uncatchably on the
+            # NEXT job (the 000 cascade). Quarantine the poison input and flag a clean
+            # restart to run AFTER the finally cleanup (NOT os._exit here - that skips
+            # finally and leaks the temp dir + serial lock).
+            if _is_hard_cuda_error(exc):
+                _quarantine_add(img_path, name, str(exc)[:200])
+                _need_hard_restart = True
+                sys.stderr.write(
+                    f"[worker] HARD CUDA fault on {name}: {type(exc).__name__}: "
+                    f"{str(exc)[:200]} - quarantined; will exit(77) after cleanup\n")
+                sys.stderr.flush()
         finally:
             _GEN_BUSY_SINCE, _GEN_BUSY_NAME = 0.0, ""
             _GEN_LOCK.release()
@@ -1176,6 +1221,101 @@ class Handler(BaseHTTPRequestHandler):
                 shutil.rmtree(img_path.parent, ignore_errors=True)
             except Exception:
                 pass
+            # Operator-requested post-render settle. synchronize() above already blocks
+            # until the free completes, so this is belt-and-suspenders for async
+            # allocator settling; default 0 (off), env POST_RENDER_SETTLE_S.
+            if POST_RENDER_SETTLE_S > 0:
+                time.sleep(POST_RENDER_SETTLE_S)
+            # A5 P0-2: hard-CUDA restart runs ONLY after full cleanup above (lock
+            # released, temp removed, cache freed, logs flushed) - never a bare
+            # os._exit mid-except that would leak them.
+            if _need_hard_restart:
+                sys.stderr.write(
+                    "[worker] cleanup complete - exiting(77) for supervisor restart\n")
+                sys.stderr.flush()
+                os._exit(77)
+
+
+# --- crash-resilience helpers (circ review 2026-08-08: Grok + GPT + A5) --------------
+POST_RENDER_SETTLE_S = float(os.environ.get("POST_RENDER_SETTLE_S", "0") or "0")
+_SUCCESS_MARKER = Path("/workspace/.last_success")
+_QUARANTINE_PATH = Path("/workspace/quarantine.json")
+
+
+def _mark_success() -> None:
+    """Touch a marker after a completed render so the supervisor resets its restart
+    backoff on real SUCCESS, not on elapsed wall-time (A5 P0-3)."""
+    try:
+        _SUCCESS_MARKER.write_text(str(time.time()))
+    except Exception:
+        pass
+
+
+def _input_hash(img_path) -> str:
+    try:
+        import hashlib
+        return hashlib.sha1(Path(img_path).read_bytes()).hexdigest()
+    except Exception:
+        return ""
+
+
+def _load_quarantine() -> dict:
+    try:
+        return json.loads(_QUARANTINE_PATH.read_text())
+    except Exception:
+        return {}
+
+
+def _is_quarantined(img_path) -> bool:
+    h = _input_hash(img_path)
+    return bool(h) and h in _load_quarantine()
+
+
+def _quarantine_add(img_path, name, reason) -> None:
+    """Record a HARD-faulting input by content hash so a re-feed is refused (A5 P0-6).
+    Only hard CUDA faults quarantine; transient OOMs do not."""
+    try:
+        h = _input_hash(img_path)
+        if not h:
+            return
+        q = _load_quarantine()
+        q[h] = {"name": name, "reason": reason, "ts": time.strftime("%Y-%m-%dT%H%M%SZ")}
+        _QUARANTINE_PATH.write_text(json.dumps(q, indent=2))
+    except Exception:
+        pass
+
+
+def _is_oom(exc) -> bool:
+    """True if exc is a CUDA out-of-memory — recoverable in-process via empty_cache +
+    retry (A5 P0-1). Does NOT require a process restart."""
+    if type(exc).__name__ == "OutOfMemoryError":
+        return True
+    s = str(exc).lower()
+    return "out of memory" in s or "cuda oom" in s
+
+
+def _is_hard_cuda_error(exc) -> bool:
+    """True if exc is a sticky/unrecoverable CUDA fault (NOT plain OOM). Such a fault
+    corrupts the context; the only reliable fix is a process restart. Kept narrow so a
+    recoverable OOM is never misclassified as fatal (A5 P0-1)."""
+    if _is_oom(exc):
+        return False
+    s = str(exc).lower()
+    return any(k in s for k in (
+        "cuda error", "device-side assert", "illegal memory access",
+        "cublas", "cudnn", "[cumesh] cuda", "misaligned address", "an illegal"))
+
+
+def _free_vram() -> None:
+    """Best-effort VRAM reclaim (gc + empty_cache + synchronize)."""
+    try:
+        gc.collect()
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+    except Exception:
+        pass
 
 
 def _busy_watchdog() -> None:
