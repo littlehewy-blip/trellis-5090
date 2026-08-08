@@ -13,8 +13,8 @@ on:
         description: "image tag"
         default: "v1"
       max_jobs:
-        description: "compile parallelism (lower if OOM)"
-        default: "4"
+        description: "compile parallelism (KEEP 1 for flash-attn sm_120 on 16GB runner)"
+        default: "1"
 
 concurrency:
   group: build-trellis
@@ -32,6 +32,18 @@ jobs:
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL
           sudo docker image prune -af || true
           df -h /
+
+      - name: Add swap (flash-attn sm_120 compile peaks >16GB RAM on the free runner)
+        run: |
+          echo "== disk before swap =="; df -h /
+          sudo swapoff -a || true
+          sudo rm -f /swapfile
+          sudo fallocate -l 20G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          echo "== swap active =="; swapon --show; free -h
+          echo "== disk after swap =="; df -h /
 
       - uses: actions/checkout@v4
 

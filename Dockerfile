@@ -13,12 +13,14 @@
 
 FROM pytorch/pytorch:2.7.1-cuda12.8-cudnn9-devel
 
-# Compile parallelism. Lower it on RAM-limited builders (GitHub Actions 16GB
-# OOMs the flash-attn compile at 8 AND at 4) via `--build-arg MAX_JOBS=2`.
-# Peak build RAM ~= MAX_JOBS * NVCC_THREADS; flash-attn defaults NVCC_THREADS=4,
-# so we cap it to 2 here. 2*2 concurrent nvcc threads fits the 16GB free runner
-# for a single-arch (sm_120) build.
-ARG MAX_JOBS=8
+# Compile parallelism. On the 16GB free GitHub runner, flash-attn's sm_120
+# (Blackwell) kernels OOM-kill the runner at MAX_JOBS 8, 4, AND 2 — a single
+# ptxas invocation can peak >10GB. Fully SERIALIZE the compile (1 job, 1 nvcc
+# thread) + rely on the 20GB host swapfile (workflow step) for headroom.
+# MAX_JOBS covers the PyTorch cpp_extension builds (flash-attn); CMAKE/MAKEFLAGS
+# below cover the cmake/make sub-builds (o-voxel, nvdiffrast) that ignore MAX_JOBS.
+ARG MAX_JOBS=1
+ARG NVCC_THREADS=1
 
 ENV DEBIAN_FRONTEND=noninteractive \
     CUDA_HOME=/usr/local/cuda \
@@ -26,7 +28,10 @@ ENV DEBIAN_FRONTEND=noninteractive \
     LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH} \
     TORCH_CUDA_ARCH_LIST=12.0 \
     MAX_JOBS=${MAX_JOBS} \
-    NVCC_THREADS=2 \
+    NVCC_THREADS=${NVCC_THREADS} \
+    CMAKE_BUILD_PARALLEL_LEVEL=1 \
+    MAKEFLAGS=-j1 \
+    PIP_NO_CACHE_DIR=1 \
     OPENCV_IO_ENABLE_OPENEXR=1 \
     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
     TRELLIS_DIR=/workspace/TRELLIS.2 \
@@ -48,7 +53,7 @@ COPY pod_setup.sh pod_worker.py proven_requirements.txt start_worker_hf.sh ops_p
 # checks (nvidia-smi / cuda forwards / ops-probe / tee log-server / worker exec) —
 # those defer to first-run. SKIP_WEIGHTS=1 => the multi-GB TRELLIS.2-4B weights are
 # NOT baked (they mount/download at /workspace/weights at runtime).
-RUN BUILD_ONLY=1 SKIP_WEIGHTS=1 FORCE_CUDA=1 TORCH_CUDA_ARCH_LIST=12.0+PTX CUDA_VISIBLE_DEVICES= bash /workspace/pod_setup.sh
+RUN BUILD_ONLY=1 SKIP_WEIGHTS=1 FORCE_CUDA=1 MAX_JOBS=1 NVCC_THREADS=1 CMAKE_BUILD_PARALLEL_LEVEL=1 MAKEFLAGS=-j1 TORCH_CUDA_ARCH_LIST=12.0 CUDA_VISIBLE_DEVICES= bash /workspace/pod_setup.sh
 
 EXPOSE 8000
 
