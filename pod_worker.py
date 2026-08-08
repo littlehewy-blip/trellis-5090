@@ -61,6 +61,23 @@ BIREFNET_MODEL_ID = os.environ.get("BIREFNET_MODEL_ID", "ZhengPeng7/BiRefNet")
 
 _pipeline = None
 _birefnet_model = None
+# #7 readiness (A5 fast-follow): lifecycle so callers back off during the MINUTES-long model
+# load / reload instead of hammering HTTP 000. "loading" -> "ready" (pipeline up) -> "dead"
+# (load raised - supervisor will restart the process). Guarded by a lock (circ 2026-08-08): a
+# plain str assignment is GIL-atomic, but the lock makes the set/read explicit and future-proof.
+_LOAD_STATE = "loading"
+_LOAD_STATE_LOCK = threading.Lock()
+
+
+def _set_load_state(state: str) -> None:
+    global _LOAD_STATE
+    with _LOAD_STATE_LOCK:
+        _LOAD_STATE = state
+
+
+def _get_load_state() -> str:
+    with _LOAD_STATE_LOCK:
+        return _LOAD_STATE
 
 # --- SERIAL-RENDER GUARD state ---------------------------------------------
 # One render at a time, process-wide. Held for the GPU section only (the
@@ -91,7 +108,7 @@ GPU_TELEMETRY_S = int(os.environ.get("GPU_TELEMETRY_S", "60"))
 # time on every container start, so a pod can silently revert to an older worker
 # and nothing downstream would notice. The driver logs this string at startup so
 # "I thought the serial guard was live" can never be a guess.
-WORKER_BUILD = "2026-08-04-podstab-p1-circular"
+WORKER_BUILD = "2026-08-08-fastfollow"
 
 # --- P0 pod-stability knobs (circular_pod_stability VERDICT, 2026-08-04) ------
 # IO_TIMEOUT_S: per-request socket timeout so a half-dead ssh -L forward cannot
@@ -127,6 +144,7 @@ def load_pipeline():
     global _pipeline
     if _pipeline is not None:
         return _pipeline
+    _set_load_state("loading")
 
     # Official TRELLIS.2 import path (microsoft/TRELLIS.2)
     Pipeline = None
@@ -182,6 +200,7 @@ def load_pipeline():
     # (fp32-force was proven wrong: it clashed with the native bf16 attention).
     _unify_pipeline_dtypes(pipe)
     _pipeline = pipe
+    _set_load_state("ready")  # #7: callers may now stop backing off
     return pipe
 
 
@@ -979,6 +998,7 @@ class Handler(BaseHTTPRequestHandler):
                     "ok": True,
                     "model": MODEL_ID,
                     "pipeline_loaded": ready,
+                    "load_state": _get_load_state(),  # #7: loading | ready | dead
                     "weights": str(WEIGHTS_DIR),
                     "busy": bool(busy_since),
                     "busy_slot": _GEN_BUSY_NAME if busy_since else "",
@@ -988,6 +1008,20 @@ class Handler(BaseHTTPRequestHandler):
                     "build": WORKER_BUILD,
                 },
             )
+            return
+        if path == "/ready":
+            # #7 readiness endpoint (A5 fast-follow): a dedicated, cheap signal so a caller can
+            # distinguish LOADING (model reloading, back off) from READY (feed now) from DEAD
+            # (load failed; supervisor is restarting). 200 only when READY, else 503 so a plain
+            # HTTP status check suffices without parsing the body.
+            _state = _get_load_state()
+            code = 200 if (_state == "ready" and _pipeline is not None) else 503
+            self._json(code, {
+                "ok": code == 200,
+                "load_state": _state,
+                "busy": bool(_GEN_BUSY_SINCE),
+                "build": WORKER_BUILD,
+            })
             return
         if path.startswith("/geo_meta/"):
             # The driver's try_fetch_geo() has always GET'd this path to recover
@@ -1104,6 +1138,23 @@ class Handler(BaseHTTPRequestHandler):
             shutil.rmtree(img_path.parent, ignore_errors=True)
             return
 
+        # --- (b) TTL SOFT-quarantine (A5 fast-follow) -----------------------
+        # An input that has repeatedly hit RESOURCE PRESSURE (too big to fit right now) is
+        # a GOOD asset, so it is NOT permanently quarantined - but re-feeding it in a tight
+        # loop just restart-storms nothing and burns cycles. Refuse it with 429 + Retry-After
+        # for a TTL window so the feeder backs off, then it auto-clears. Never permanent.
+        _soft_until = _soft_quarantined_until(img_path)
+        if _soft_until:
+            _wait = max(1, int(_soft_until - time.time()))
+            sys.stderr.write(f"[worker] 429 SOFT-QUARANTINE {name}: repeated resource-pressure, "
+                             f"backoff {_wait}s\n")
+            self._json(429, {"ok": False,
+                             "error": "input soft-quarantined (repeated resource-pressure); retry later",
+                             "name": name, "retry_after_s": _wait},
+                       extra_headers={"X-Worker-Build": WORKER_BUILD, "Retry-After": str(_wait)})
+            shutil.rmtree(img_path.parent, ignore_errors=True)
+            return
+
         # --- phase 2: SERIAL-RENDER GUARD -----------------------------------
         # Non-blocking: a busy worker refuses immediately with 429 so the driver
         # can wait and re-offer, instead of a second render stacking on the GPU.
@@ -1131,6 +1182,11 @@ class Handler(BaseHTTPRequestHandler):
         mark_progress("accepted")
         sent = False
         _need_hard_restart = False
+        # VRAM ledger (A5 fast-follow): per-job telemetry, best-effort, NEVER breaks a render.
+        _oom_retries = 0
+        _outcome = "ok"
+        _asset_class = _classify_asset(name)
+        _ledger = _vram_ledger_start()  # resets torch peak stats + samples free_at_start
         try:
             try:
                 glb, geo_meta = image_to_glb_bytes(img_path)
@@ -1139,11 +1195,15 @@ class Handler(BaseHTTPRequestHandler):
                 # does NOT corrupt the CUDA context. Free VRAM and retry ONCE in-process
                 # (staying alive) rather than escalating to process death. A 2nd OOM
                 # propagates to the outer handler -> 500, and we STILL stay alive.
-                if _is_oom(_oom_exc):
+                # (a) A5 fast-follow: retry on ANY transient RESOURCE-PRESSURE fault - plain
+                # OOM OR a cuBLAS/cuDNN ALLOC_FAILED. Both are a good input losing a VRAM race,
+                # not context corruption, so free+retry once instead of a MINUTES-long restart.
+                if _is_resource_pressure(_oom_exc):
                     sys.stderr.write(
-                        f"[worker] OOM on {name}: freeing VRAM + retrying once "
+                        f"[worker] resource-pressure on {name}: freeing VRAM + retrying once "
                         f"({type(_oom_exc).__name__})\n")
                     sys.stderr.flush()
+                    _oom_retries += 1
                     _free_vram()
                     mark_progress("oom-retry")  # reset watchdog stall timer for attempt 2
                     glb, geo_meta = image_to_glb_bytes(img_path)
@@ -1158,6 +1218,7 @@ class Handler(BaseHTTPRequestHandler):
             self._bytes(200, glb, "model/gltf-binary", f"{name}.glb",
                         extra_headers=headers)
             _mark_success()  # supervisor resets restart-backoff only on a real render (P0-3)
+            _outcome = "oom_retry_ok" if _oom_retries else "ok"
         except (BrokenPipeError, ConnectionResetError, socket.timeout,
                 TimeoutError) as exc:
             # The client (or the ssh tunnel) went away, or the send timed out on
@@ -1180,6 +1241,7 @@ class Handler(BaseHTTPRequestHandler):
                     f"{name}: errno={exc.errno} {exc} - render completed, response lost\n")
             else:
                 self._error_500(name, exc)
+                _outcome = "error_500"
         except Exception as exc:
             self._error_500(name, exc)
             # circ review 2026-08-08 (Grok+GPT+A5 P0-1/P0-2/P0-6): OOM is non-fatal
@@ -1190,12 +1252,36 @@ class Handler(BaseHTTPRequestHandler):
             # restart to run AFTER the finally cleanup (NOT os._exit here - that skips
             # finally and leaks the temp dir + serial lock).
             if _is_hard_cuda_error(exc):
-                _quarantine_add(img_path, name, str(exc)[:200])
+                # circ review 2026-08-08 (Grok+GPT, A5 P1): a hard fault ALWAYS restarts
+                # (context may be corrupt), but only DETERMINISTIC poison quarantines the
+                # input. NOTE: after (a), a cuBLAS/cuDNN ALLOC_FAILED is classed as resource
+                # pressure (below), NOT hard - so this branch is genuine corruption only.
                 _need_hard_restart = True
+                _outcome = "hard_fault"
+                if _is_poison(exc):
+                    _quarantine_add(img_path, name, str(exc)[:200])
+                    _fault_reason = "deterministic poison - quarantined"
+                else:
+                    # Non-deterministic hard fault (e.g. cuBLAS/cuDNN alloc failure that we now
+                    # restart on rather than retry, per circ): the input is likely GOOD, so do NOT
+                    # permanently quarantine - but strike the TTL soft-quarantine so a re-feed that
+                    # keeps faulting backs off instead of restart-storming the pod (circ (b)).
+                    _soft_quarantine_note(img_path, name, str(exc)[:160])
+                    _fault_reason = ("non-deterministic hard fault - NOT quarantined "
+                                     "(good input preserved); soft-quarantine struck")
                 sys.stderr.write(
                     f"[worker] HARD CUDA fault on {name}: {type(exc).__name__}: "
-                    f"{str(exc)[:200]} - quarantined; will exit(77) after cleanup\n")
+                    f"{str(exc)[:160]} - {_fault_reason}; will exit(77) after cleanup\n")
                 sys.stderr.flush()
+            elif _is_resource_pressure(exc):
+                # (a)+(b) A5 fast-follow: the in-process retry above still lost the VRAM race
+                # -> 500 but STAY ALIVE (context is fine, no restart). (b) bound repeats: note
+                # it in the TTL soft-quarantine so a persistently-too-big input backs off for a
+                # while, WITHOUT a permanent poison quarantine (it is still a GOOD asset).
+                _outcome = "oom_500"
+                _soft_quarantine_note(img_path, name, str(exc)[:160])
+            else:
+                _outcome = "error_500"
         finally:
             _GEN_BUSY_SINCE, _GEN_BUSY_NAME = 0.0, ""
             _GEN_LOCK.release()
@@ -1221,6 +1307,10 @@ class Handler(BaseHTTPRequestHandler):
                 shutil.rmtree(img_path.parent, ignore_errors=True)
             except Exception:
                 pass
+            # VRAM ledger row (A5 fast-follow): recorded for EVERY outcome incl. OOM/hard-fault
+            # (in finally so it logs even on exit-after-cleanup), so "do we need more VRAM?" is
+            # answered from data, not crashes. Best-effort; never raises.
+            _vram_ledger_write(name, _asset_class, _ledger, _oom_retries, _outcome)
             # Operator-requested post-render settle. synchronize() above already blocks
             # until the free completes, so this is belt-and-suspenders for async
             # allocator settling; default 0 (off), env POST_RENDER_SETTLE_S.
@@ -1259,6 +1349,25 @@ def _input_hash(img_path) -> str:
         return ""
 
 
+def _atomic_write_json(path, obj) -> None:
+    """Write JSON atomically (temp in the same dir + fsync + os.replace) so a crash or os._exit
+    mid-write can never leave a truncated file that _load_* then fails to parse (circ 2026-08-08).
+    Falls back to a plain write only if the atomic path itself errors. Best-effort; never raises."""
+    try:
+        with tempfile.NamedTemporaryFile("w", dir=str(path.parent), delete=False,
+                                         encoding="utf-8") as tf:
+            json.dump(obj, tf, indent=2)
+            tf.flush()
+            os.fsync(tf.fileno())
+            tmp = tf.name
+        os.replace(tmp, str(path))
+    except Exception:
+        try:
+            path.write_text(json.dumps(obj, indent=2))
+        except Exception:
+            pass
+
+
 def _load_quarantine() -> dict:
     try:
         return json.loads(_QUARANTINE_PATH.read_text())
@@ -1280,7 +1389,7 @@ def _quarantine_add(img_path, name, reason) -> None:
             return
         q = _load_quarantine()
         q[h] = {"name": name, "reason": reason, "ts": time.strftime("%Y-%m-%dT%H%M%SZ")}
-        _QUARANTINE_PATH.write_text(json.dumps(q, indent=2))
+        _atomic_write_json(_QUARANTINE_PATH, q)
     except Exception:
         pass
 
@@ -1294,16 +1403,180 @@ def _is_oom(exc) -> bool:
     return "out of memory" in s or "cuda oom" in s
 
 
+def _is_resource_pressure(exc) -> bool:
+    """True ONLY for a clean CUDA OOM that is safe to retry in-process.
+
+    A5 fast-follow (a) originally asked to also treat cuBLAS/cuDNN ALLOC_FAILED as
+    retry-in-process. The Grok+GPT circ (2026-08-08) REJECTED that: an alloc failure raised from
+    inside a cuBLAS/cuDNN kernel can leave the CUDA context sticky/corrupt, so retrying re-uses a
+    bad context (deterministic re-fail or silent garbage). A plain torch.OutOfMemoryError is raised
+    at the Python allocation boundary with the context INTACT, so it alone is retry-safe. cuBLAS/
+    cuDNN alloc failures therefore fall through to _is_hard_cuda_error -> restart (fresh context),
+    and the restart-storm they could cause is bounded by the soft-quarantine on the non-poison
+    hard-fault path. (A5 to confirm this safety override of item (a).)"""
+    return _is_oom(exc)
+
+
 def _is_hard_cuda_error(exc) -> bool:
-    """True if exc is a sticky/unrecoverable CUDA fault (NOT plain OOM). Such a fault
-    corrupts the context; the only reliable fix is a process restart. Kept narrow so a
-    recoverable OOM is never misclassified as fatal (A5 P0-1)."""
-    if _is_oom(exc):
+    """True if exc is a sticky/unrecoverable CUDA fault (NOT transient resource pressure).
+    Such a fault corrupts the context; the only reliable fix is a process restart. Kept narrow
+    so a recoverable OOM / cuBLAS-alloc failure is never misclassified as fatal (A5 P0-1, and
+    A5 fast-follow (a): resource-pressure allocations are excluded here so they free+retry, not
+    restart)."""
+    if _is_resource_pressure(exc):
         return False
     s = str(exc).lower()
     return any(k in s for k in (
         "cuda error", "device-side assert", "illegal memory access",
         "cublas", "cudnn", "[cumesh] cuda", "misaligned address", "an illegal"))
+
+
+def _is_poison(exc) -> bool:
+    """True ONLY for DETERMINISTIC, input-triggered CUDA faults that recur on the SAME input
+    every time, so the input must be quarantined (A5 P0-6). Poison is a POSITIVE allow-list:
+    a transient resource-pressure fault (plain OOM, cuBLAS/cuDNN ALLOC_FAILED) never matches,
+    so a good input is never permanently quarantined (A5 P1 decouple). Because it is a positive
+    match, a poison message that ALSO contains 'alloc' is still correctly quarantined - closing
+    the precedence hole the circ review (Grok+GPT 2026-08-08) flagged in an early-exclusion design.
+    NOTE: _is_hard_cuda_error still restarts on non-alloc cublas/cudnn/generic 'cuda error';
+    this only governs QUARANTINE, never restart."""
+    if _is_resource_pressure(exc):
+        return False
+    s = str(exc).lower()
+    return any(k in s for k in (
+        "device-side assert", "illegal memory access", "[cumesh] cuda",
+        "misaligned address", "an illegal"))
+
+
+# --- (b) TTL soft-quarantine + VRAM ledger + asset classifier (A5 fast-follow) -------
+_SOFT_QUARANTINE_PATH = Path("/workspace/soft_quarantine.json")
+SOFT_QUARANTINE_THRESHOLD = int(os.environ.get("SOFT_QUARANTINE_THRESHOLD", "3"))
+SOFT_QUARANTINE_TTL_S = int(os.environ.get("SOFT_QUARANTINE_TTL_S", "1800"))
+_VRAM_LEDGER_PATH = Path(os.environ.get("VRAM_LEDGER_PATH", "/workspace/vram_ledger.csv"))
+_VRAM_LEDGER_HEADER = ("ts_utc,slug,asset_class,torch_peak_reserved_gib,smi_used_peak_gib,"
+                       "free_at_start_gib,oom_retries,outcome")
+
+
+def _load_soft_quarantine() -> dict:
+    try:
+        return json.loads(_SOFT_QUARANTINE_PATH.read_text())
+    except Exception:
+        return {}
+
+
+def _soft_quarantine_note(img_path, name, reason) -> None:
+    """(b) Record a RESOURCE-PRESSURE 500 for this input. After SOFT_QUARANTINE_THRESHOLD hits
+    inside one TTL window, stamp an `until` so re-feeds get a 429 backoff for SOFT_QUARANTINE_TTL_S.
+    This is TEMPORARY (a good asset that is momentarily too big), never a permanent poison
+    quarantine. Best-effort; never raises."""
+    try:
+        h = _input_hash(img_path)
+        if not h:
+            return
+        q = _load_soft_quarantine()
+        now = time.time()
+        e = q.get(h) or {"count": 0, "first_ts": now, "name": name}
+        # roll the window: if the last strike is older than the TTL, start counting fresh
+        if now - e.get("first_ts", now) > SOFT_QUARANTINE_TTL_S:
+            e = {"count": 0, "first_ts": now, "name": name}
+        e["count"] = int(e.get("count", 0)) + 1
+        e["last_reason"] = reason
+        e["last_ts"] = now
+        if e["count"] >= SOFT_QUARANTINE_THRESHOLD:
+            e["until"] = now + SOFT_QUARANTINE_TTL_S
+        q[h] = e
+        _atomic_write_json(_SOFT_QUARANTINE_PATH, q)
+    except Exception:
+        pass
+
+
+def _soft_quarantined_until(img_path) -> float:
+    """Return the epoch until which this input is soft-quarantined, or 0 if not (or expired)."""
+    try:
+        h = _input_hash(img_path)
+        if not h:
+            return 0.0
+        e = _load_soft_quarantine().get(h)
+        if not e:
+            return 0.0
+        until = float(e.get("until", 0) or 0)
+        return until if until > time.time() else 0.0
+    except Exception:
+        return 0.0
+
+
+def _classify_asset(name) -> str:
+    """Coarse asset class from the slug, for per-class VRAM profiling in the ledger. Best-effort;
+    'unknown' when nothing matches. (Data-driven off-pod routing later keys off this.)"""
+    try:
+        s = str(name).lower()
+        if any(k in s for k in ("char", "npc", "clown", "creature", "figure", "person", "mf_")):
+            return "character"
+        if any(k in s for k in ("canopy", "fern", "bush", "shrub", "foliage", "tree", "willow",
+                                "conifer", "cedar", "frond", "leaf")):
+            return "foliage"
+        if any(k in s for k in ("rock", "granite", "basalt", "boulder", "stone", "cliff",
+                                "terrain", "log", "mound", "mushroom", "chanterelle")):
+            return "nature"
+        if any(k in s for k in ("prop", "crate", "barrel", "sign", "tool", "weapon")):
+            return "prop"
+        return "unknown"
+    except Exception:
+        return "unknown"
+
+
+def _smi_used_gib() -> float:
+    """Best-effort whole-card memory.used in GiB via nvidia-smi. -1.0 if unavailable."""
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=4)
+        return round(int(out.stdout.strip().splitlines()[0]) / 1024.0, 2)
+    except Exception:
+        return -1.0
+
+
+def _vram_ledger_start() -> dict:
+    """START hook: reset torch peak stats and sample free_at_start. Returns a small dict passed
+    to _vram_ledger_write. Best-effort; never raises."""
+    d = {"free_at_start_gib": -1.0}
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+            free_b, _total_b = torch.cuda.mem_get_info()
+            d["free_at_start_gib"] = round(free_b / (1024 ** 3), 2)
+    except Exception:
+        pass
+    return d
+
+
+def _vram_ledger_write(name, asset_class, start, oom_retries, outcome) -> None:
+    """END hook (called in finally): append one row. torch_peak = was the JOB big; smi_used_peak
+    = was the CARD crowded (co-residency). MINIMAL smi variant: sampled once at job end (noted to
+    A5). Telemetry MUST NEVER break a render -> fully swallowed. Writes header once."""
+    try:
+        torch_peak = -1.0
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch_peak = round(torch.cuda.max_memory_reserved() / (1024 ** 3), 2)
+        except Exception:
+            pass
+        row = "{ts},{slug},{cls},{tp},{smi},{fs},{r},{o}".format(
+            ts=time.strftime("%Y-%m-%dT%H%M%SZ", time.gmtime()),
+            slug=str(name).replace(",", "_"),
+            cls=str(asset_class).replace(",", "_"),
+            tp=torch_peak, smi=_smi_used_gib(),
+            fs=start.get("free_at_start_gib", -1.0),
+            r=int(oom_retries), o=str(outcome).replace(",", "_"))
+        new = not _VRAM_LEDGER_PATH.exists()
+        with _VRAM_LEDGER_PATH.open("a", encoding="utf-8") as fh:
+            if new:
+                fh.write(_VRAM_LEDGER_HEADER + "\n")
+            fh.write(row + "\n")
+    except Exception:
+        pass
 
 
 def _free_vram() -> None:
@@ -1475,6 +1748,9 @@ def main() -> int:
         load_pipeline()
         print(f"[worker] pipeline loaded; listening on 0.0.0.0:{PORT}", flush=True)
     except Exception as exc:
+        # #7: eager load failed. Mark DEAD so /ready returns 503 and callers back off; the next
+        # /generate re-enters load_pipeline() (which flips loading->ready on success).
+        _set_load_state("dead")
         print(f"[worker] pipeline load deferred (will retry on first request): {exc}", flush=True)
 
     httpd = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)

@@ -59,7 +59,7 @@ EXPOSE 8000
 
 # Deferred GPU gate: the container is healthy only once the real ops probe passes
 # on the actual GPU host. start_worker_hf.sh runs the same probe before serving.
-HEALTHCHECK --interval=30s --timeout=30s --start-period=15m --retries=3 \
+HEALTHCHECK --interval=30s --timeout=30s --start-period=20m --retries=10 \
   CMD curl -fsS http://localhost:8000/health || exit 1
 
 # Entry = the SUPERVISOR (circ review 2026-08-08, A5 P0 crash fix): it runs start_worker_hf.sh
