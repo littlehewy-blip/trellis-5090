@@ -44,7 +44,7 @@ COPY pod_setup.sh pod_worker.py proven_requirements.txt start_worker_hf.sh ops_p
 # checks (nvidia-smi / cuda forwards / ops-probe / tee log-server / worker exec) —
 # those defer to first-run. SKIP_WEIGHTS=1 => the multi-GB TRELLIS.2-4B weights are
 # NOT baked (they mount/download at /workspace/weights at runtime).
-RUN BUILD_ONLY=1 SKIP_WEIGHTS=1 bash /workspace/pod_setup.sh
+RUN BUILD_ONLY=1 SKIP_WEIGHTS=1 FORCE_CUDA=1 TORCH_CUDA_ARCH_LIST=12.0+PTX CUDA_VISIBLE_DEVICES= bash /workspace/pod_setup.sh
 
 EXPOSE 8000
 

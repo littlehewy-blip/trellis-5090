@@ -148,7 +148,7 @@ if [[ -f setup.sh ]]; then
   echo "[pod_setup] running official TRELLIS.2 setup.sh (CUDA ops compile — expect 20–40 min)..."
   set +e
   # shellcheck disable=SC1091
-  . ./setup.sh --basic --nvdiffrast --nvdiffrec --cumesh --o-voxel --flexgemm
+  bash ./setup.sh --basic --nvdiffrast --nvdiffrec --cumesh --o-voxel --flexgemm
   SETUP_RC=$?
   set -e
   if [[ $SETUP_RC -ne 0 ]]; then
