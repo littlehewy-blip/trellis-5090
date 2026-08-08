@@ -1,0 +1,58 @@
+# TRELLIS.2 image for RTX 5090 (Blackwell / sm_120, cu128).
+# Bakes the PROVEN VN env once (compile flash-attn/spconv/kaolin/nvdiffrast/cumesh)
+# so pods start in minutes instead of a ~1hr per-pod compile.
+# Faithful to /workspace/pod_setup.sh on the VN pod; weights are NOT baked
+# (mounted/downloaded at runtime via HF_TOKEN) to keep the image lean.
+#
+# GPU-FREE BUILD (2026-08-08 refactor): pod_setup.sh runs with BUILD_ONLY=1, which
+# nvcc-cross-compiles the CUDA ops for sm_120 (TORCH_CUDA_ARCH_LIST=12.0) with NO
+# GPU present, and DEFERS every runtime GPU touch (nvidia-smi, torch.cuda forwards,
+# the ops probe) to container first-run (start_worker_hf.sh -> ops_probe.py) and the
+# HEALTHCHECK. So `docker build` needs Docker + CPU/RAM/disk only — no GPU. Build it
+# anywhere (GitHub Actions -> ghcr.io, a CPU VM, etc.), then run on a 5090 pod.
+
+FROM pytorch/pytorch:2.7.1-cuda12.8-cudnn9-devel
+
+# Compile parallelism. Lower it on RAM-limited builders (GitHub Actions 16GB
+# OOMs the flash-attn compile at 8) via `--build-arg MAX_JOBS=4`.
+ARG MAX_JOBS=8
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    CUDA_HOME=/usr/local/cuda \
+    PATH=/usr/local/cuda/bin:${PATH} \
+    LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH} \
+    TORCH_CUDA_ARCH_LIST=12.0 \
+    MAX_JOBS=${MAX_JOBS} \
+    OPENCV_IO_ENABLE_OPENEXR=1 \
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    TRELLIS_DIR=/workspace/TRELLIS.2 \
+    WEIGHTS_DIR=/workspace/weights/TRELLIS.2-4B \
+    WORKER_PORT=8000 \
+    PYTHONPATH=/workspace/TRELLIS.2
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      git ninja-build build-essential libgl1 libglib2.0-0 wget curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+
+# Proven build script + worker + pin list + first-run probe, from the VN pod.
+COPY pod_setup.sh pod_worker.py proven_requirements.txt start_worker_hf.sh ops_probe.py /workspace/
+
+# Compile CUDA ops + install pinned deps ONCE, GPU-FREE. BUILD_ONLY=1 => nvcc
+# cross-compiles the ops for sm_120 with no device, and skips the runtime GPU
+# checks (nvidia-smi / cuda forwards / ops-probe / tee log-server / worker exec) —
+# those defer to first-run. SKIP_WEIGHTS=1 => the multi-GB TRELLIS.2-4B weights are
+# NOT baked (they mount/download at /workspace/weights at runtime).
+RUN BUILD_ONLY=1 SKIP_WEIGHTS=1 bash /workspace/pod_setup.sh
+
+EXPOSE 8000
+
+# Deferred GPU gate: the container is healthy only once the real ops probe passes
+# on the actual GPU host. start_worker_hf.sh runs the same probe before serving.
+HEALTHCHECK --interval=30s --timeout=30s --start-period=15m --retries=3 \
+  CMD curl -fsS http://localhost:8000/health || exit 1
+
+# start_worker_hf.sh reads /workspace/.hf_token (mount as secret at runtime) and
+# serves pod_worker.py on :8000. Weights download on first run if the volume is empty.
+CMD ["bash", "/workspace/start_worker_hf.sh"]
